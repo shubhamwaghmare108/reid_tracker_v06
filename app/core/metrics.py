@@ -18,6 +18,9 @@ CSV_COLUMNS = ('session_id frame timestamp event_type track_id identity track_st
                'association_score reid_margin recovery_result rejection_reason identity_owner previous_identity '
                'current_identity previous_track_state current_track_state gallery_action presence_event').split()
 
+TRACK_STATE_NAMES = {0: 'TENTATIVE', 1: 'CONFIRMED', 2: 'OCCLUDED', 3: 'RECOVERED', 4: 'LOST', 5: 'DELETED'}
+IDENTITY_STATE_NAMES = {0: 'UNKNOWN', 1: 'CANDIDATE', 2: 'CONFIRMED', 3: 'RETAINED'}
+
 
 class MetricsCollector:
     """Buffered, best-effort metrics collector; it never changes tracker decisions."""
@@ -50,7 +53,8 @@ class MetricsCollector:
 
     def record(self, event_type: str, frame: int, timestamp: float = 0., track=None, **values: Any) -> None:
         if not self.enabled: return
-        self.counters[event_type] += 1
+        increment = values.pop('count', 1)
+        self.counters[event_type] += increment
         track_id = values.pop('track_id', getattr(track, 'tracker_id', ''))
         identity = values.pop('identity', getattr(track, 'name', ''))
         if track_id != '':
@@ -77,12 +81,19 @@ class MetricsCollector:
             self.identity_data[identity]['in_events' if event_type == 'PRESENCE_IN' else 'out_events'] += 1
         if identity and identity != 'Unknown' and event_type == 'IDENTITY_SWITCH':
             self.identity_data[identity]['identity_switches'] += 1
-        if event_type == 'ASSOCIATION_REJECTED': self.rejections[values.get('rejection_reason', 'NO_SAFE_MATCH')] += 1
+        if event_type == 'ASSOCIATION_REJECTED':
+            self.rejections[values.get('rejection_reason', 'NO_SAFE_MATCH')] += 1
+            reason = values.get('rejection_reason', 'NO_SAFE_MATCH')
+            category = {'REID_GATE_FAIL': 'association_reject_reid', 'RECOVERY_REID_GATE_FAIL': 'association_reject_reid', 'IOU_GATE_FAIL': 'association_reject_iou', 'MOTION_GATE_FAIL': 'association_reject_motion', 'SCALE_GATE_FAIL': 'association_reject_scale', 'COMBINED_GATE_FAIL': 'association_reject_combined', 'LOW_DETECTION_CONFIDENCE': 'association_reject_confidence', 'NO_SAFE_MATCH': 'association_reject_no_safe_match'}.get(reason)
+            if category: self.counters[category] += 1
         if event_type == 'IDENTITY_OWNER_CONFLICT': self.rejections['IDENTITY_OWNER_CONFLICT'] += 1
+        if event_type == 'GALLERY_UPDATE_REJECTED': self.rejections[values.get('rejection_reason', 'GALLERY_REJECT_OTHER')] += 1
         if not self.event_logging or (event_type == 'DETECTION' and not self.log_detections): return
         row = {key: '' for key in CSV_COLUMNS}; row.update(values)
+        track_state = getattr(track, 'state', '')
+        identity_state = getattr(track, 'identity_state', '')
         row.update(session_id=self.session.get('session_id', ''), frame=frame, timestamp=f'{timestamp:.3f}', event_type=event_type, track_id=track_id, identity=identity,
-                   track_state=getattr(track, 'state', ''), identity_state=getattr(track, 'identity_state', ''))
+               track_state=TRACK_STATE_NAMES.get(track_state, track_state), identity_state=IDENTITY_STATE_NAMES.get(identity_state, identity_state))
         self.events.append(row)
         if len(self.events) >= self.flush_size: self._flush()
 
@@ -99,12 +110,14 @@ class MetricsCollector:
         self.session.update(ended_at=datetime.now(timezone.utc).isoformat(), total_frames=total_frames, duration_seconds=total_frames / fps if fps else 0.)
         for track in tracks:
             data = self.track_data.setdefault(track.tracker_id, {'track_id': track.tracker_id, 'first_frame': 0, 'last_frame': total_frames, 'observations': 0, 'missed_frames': 0, 'occlusion_count': 0, 'occlusion_frames': 0, 'recovery_attempts': 0, 'successful_recoveries': 0, 'failed_recoveries': 0, 'ambiguous_recoveries': 0, 'identity_changes': 0, 'gallery_update_attempts': 0, 'gallery_updates_accepted': 0, 'gallery_updates_rejected': 0})
-            data.update(identity=track.name, final_track_state=track.state, final_identity_state=track.identity_state, missed_frames=track.missed_frames, occlusion_frames=track.occlusion_frames)
+            data.update(identity=track.name, final_track_state=TRACK_STATE_NAMES.get(track.state, track.state), final_track_state_id=track.state,
+                        final_identity_state=IDENTITY_STATE_NAMES.get(track.identity_state, track.identity_state), final_identity_state_id=track.identity_state,
+                        missed_frames=track.missed_frames, occlusion_frames=track.occlusion_frames)
         identities = []
         for name, data in self.identity_data.items():
             data = dict(data); data['track_ids'] = sorted(int(x) for x in data['track_ids'] if x != ''); identities.append({'identity': name, **data})
         attempts = self.counters['RECOVERY_ATTEMPT']; success = self.counters['RECOVERY_SUCCESS']; failed = self.counters['RECOVERY_FAILED']; ambiguous = self.counters['RECOVERY_AMBIGUOUS']
-        metrics = {'total_detections': self.counters['DETECTION'], 'unique_tracker_ids': len(self.track_data), 'confirmed_identities': sum(d['confirmed'] for d in self.identity_data.values()), 'track_fragments': self.counters['TRACK_FRAGMENT'], 'id_switches': self.counters['IDENTITY_SWITCH'], 'false_identity_claims': self.counters['IDENTITY_OWNER_CONFLICT'], 'recovery_attempts': attempts, 'successful_recoveries': success, 'failed_recoveries': failed, 'ambiguous_recoveries': ambiguous, 'in_events': self.counters['PRESENCE_IN'], 'out_events': self.counters['PRESENCE_OUT'], 'false_in_events': None, 'false_out_events': None, 'gallery_update_attempts': self.counters['GALLERY_UPDATE_ATTEMPT'], 'gallery_updates_accepted': self.counters['GALLERY_UPDATE_ACCEPTED'], 'gallery_updates_rejected': self.counters['GALLERY_UPDATE_REJECTED'], 'gallery_bad_updates': 0, 'association_rejections': self.counters['ASSOCIATION_REJECTED'], 'processing_time_seconds': elapsed, 'processing_fps': total_frames / elapsed if elapsed else 0.}
+        metrics = {'detections_raw': self.counters['DETECTION_RAW'] or self.counters['DETECTION'], 'detections_after_confidence_filter': self.counters['DETECTIONS_AFTER_CONFIDENCE_FILTER'], 'detections_after_bbox_filter': self.counters['DETECTIONS_AFTER_BBOX_FILTER'], 'detections_after_deduplication': self.counters['DETECTIONS_AFTER_DEDUPLICATION'], 'total_detections_raw': self.counters['DETECTION_RAW'] or self.counters['DETECTION'], 'total_detections_valid': self.counters['DETECTIONS_AFTER_BBOX_FILTER'], 'total_detections_deduplicated': self.counters['DETECTIONS_AFTER_DEDUPLICATION'], 'total_detections': self.counters['DETECTIONS_AFTER_DEDUPLICATION'] or self.counters['DETECTION'], 'unique_tracker_ids': len(self.track_data), 'confirmed_identities': sum(d['confirmed'] for d in self.identity_data.values()), 'track_fragments': self.counters['TRACK_FRAGMENT'], 'fragments_by_identity': {name: max(0, len(data['track_ids']) - 1) for name, data in self.identity_data.items()}, 'id_switches': self.counters['IDENTITY_SWITCH'], 'identity_confirmations': self.counters['IDENTITY_CONFIRMED'], 'identity_retentions': self.counters['IDENTITY_RETAINED'], 'identity_owner_conflicts': self.counters['IDENTITY_OWNER_CONFLICT'], 'false_identity_claims': None, 'recovery_attempts': attempts, 'successful_recoveries': success, 'failed_recoveries': failed, 'ambiguous_recoveries': ambiguous, 'recovery_rejected': self.counters['RECOVERY_REJECTED'], 'in_events': self.counters['PRESENCE_IN'], 'out_events': self.counters['PRESENCE_OUT'], 'total_in_events': self.counters['PRESENCE_IN'], 'total_out_events': self.counters['PRESENCE_OUT'], 'false_in_events': None, 'false_out_events': None, 'gallery_update_attempts': self.counters['GALLERY_UPDATE_ATTEMPT'], 'gallery_updates_accepted': self.counters['GALLERY_UPDATE_ACCEPTED'], 'gallery_updates_rejected': self.counters['GALLERY_UPDATE_REJECTED'], 'association_attempts': self.counters['ASSOCIATION_ATTEMPT'], 'association_successes': self.counters['TRACK_MATCHED'], 'association_rejections': self.counters['ASSOCIATION_REJECTED'], 'association_reject_reid': self.counters['association_reject_reid'], 'association_reject_iou': self.counters['association_reject_iou'], 'association_reject_motion': self.counters['association_reject_motion'], 'association_reject_scale': self.counters['association_reject_scale'], 'association_reject_combined': self.counters['association_reject_combined'], 'association_reject_confidence': self.counters['association_reject_confidence'], 'association_reject_no_safe_match': self.counters['association_reject_no_safe_match'], 'processing_time_seconds': elapsed, 'processing_fps': total_frames / elapsed if elapsed else 0.}
         payload = {'session': self.session, 'metrics': metrics, 'rejection_reasons': dict(self.rejections), 'recovery': {'attempts': attempts, 'successful': success, 'failed': failed, 'ambiguous': ambiguous, 'recovery_success_rate': success / attempts if attempts else 0., 'recovery_failure_rate': failed / attempts if attempts else 0., 'recovery_ambiguity_rate': ambiguous / attempts if attempts else 0.}, 'tracks': sorted(self.track_data.values(), key=lambda x: x['track_id']), 'identities': identities, 'configuration': self.configuration, 'id_switch_ground_truth_metrics': None, 'metrics_write_success': True, 'events_write_success': self.events_write_success}
         try:
             (self.run_dir / 'metrics.json').write_text(json.dumps(payload, indent=2, default=str), encoding='utf-8'); self.metrics_write_success = True

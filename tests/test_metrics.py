@@ -56,5 +56,24 @@ class MetricsCollectorTests(unittest.TestCase):
             collector.start_session('V08.mp4', 30., {}); collector.finalize(0, None, [], 30.)
             self.assertEqual(list(Path(temp).rglob('*')), [])
 
+    def test_csv_uses_state_names_and_detection_lifecycle_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            collector = MetricsCollector(output_dir=temp, flush_size=1)
+            collector.start_session('V08.mp4', 30., {})
+            person = track()
+            collector.record('DETECTION_RAW', 1, count=4)
+            collector.record('DETECTIONS_AFTER_CONFIDENCE_FILTER', 1, count=3)
+            collector.record('DETECTIONS_AFTER_BBOX_FILTER', 1, count=2)
+            collector.record('DETECTIONS_AFTER_DEDUPLICATION', 1, count=1)
+            collector.record('TRACK_MATCHED', 1, track=person)
+            collector.finalize(1, None, [person], 30.)
+            data = json.loads((collector.run_dir / 'metrics.json').read_text())
+            self.assertEqual(data['metrics']['detections_raw'], 4)
+            self.assertEqual(data['metrics']['detections_after_bbox_filter'], 2)
+            self.assertEqual(data['metrics']['detections_after_deduplication'], 1)
+            csv_text = (collector.run_dir / 'events.csv').read_text()
+            self.assertIn('CONFIRMED', csv_text)
+            self.assertNotIn(',1,2,', csv_text)
+
 
 if __name__ == '__main__': unittest.main()

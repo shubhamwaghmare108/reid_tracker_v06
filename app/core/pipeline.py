@@ -63,6 +63,11 @@ class ReIDPipeline:
             motion_confidence_threshold=settings.tracker_motion_confidence_threshold,
             gallery_update_threshold=settings.tracker_gallery_update_threshold,
             normal_reid_gate=settings.tracker_normal_reid_gate,
+            strong_reid_gate=settings.tracker_strong_reid_gate,
+            normal_iou_gate=settings.tracker_normal_iou_gate,
+            strong_reid_iou_bypass=settings.tracker_strong_reid_iou_bypass,
+            low_motion_reid_gate=settings.tracker_low_motion_reid_gate,
+            weak_motion_distance=settings.tracker_weak_motion_distance,
             detection_dedup_iou=settings.tracker_detection_dedup_iou,
             min_detection_confidence=settings.tracker_min_detection_confidence,
             min_detection_width=settings.tracker_min_detection_width,
@@ -241,5 +246,7 @@ class ReIDPipeline:
         """Non-secret settings needed to reproduce a metrics run."""
         keys = ('tracker_motion_gate_threshold', 'tracker_association_min_iou', 'tracker_association_max_scale_change',
                 'tracker_recovery_reid_threshold', 'tracker_recovery_margin', 'tracker_identity_lock_timeout',
-                'tracker_gallery_update_threshold', 'tracker_identity_candidate_min_frames', 'tracker_max_occlusion_frames')
+            'tracker_gallery_update_threshold', 'tracker_identity_candidate_min_frames', 'tracker_max_occlusion_frames',
+            'tracker_normal_reid_gate', 'tracker_strong_reid_gate', 'tracker_normal_iou_gate',
+            'tracker_strong_reid_iou_bypass')
         return {key: getattr(self.settings, key) for key in keys}

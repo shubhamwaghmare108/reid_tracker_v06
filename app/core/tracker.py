@@ -52,6 +52,12 @@ class IdentityState:
     UNKNOWN, CANDIDATE, CONFIRMED, RETAINED = range(4)
 
 
+@dataclass(frozen=True)
+class GateResult:
+    accepted: bool
+    reason: str = ''
+
+
 @dataclass
 class Track:
     tracker_id: int; bbox: np.ndarray; body_embedding: np.ndarray; face_embedding: np.ndarray | None = None
@@ -108,11 +114,12 @@ class Track:
 
 class ReIDTracker:
     """Hungarian multi-cue tracker; long-term recovery is stricter than normal matching."""
-    def __init__(self, gallery: Gallery, extractor, face_processor=None, threshold=.75, margin=.15, max_lost_frames=30, min_hits_to_confirm=3, iou_threshold=.3, appearance_weight=.5, w_body=.5, w_face=.5, *, max_occlusion_frames=45, max_recovery_frames=180, max_trajectory_history=30, max_body_gallery=12, max_face_gallery=6, occlusion_iou_threshold=.15, recovery_reid_threshold=.78, motion_gate_threshold=4., recovery_motion_gate=8., turn_threshold=.75, motion_confidence_threshold=.45, gallery_update_threshold=.72, normal_reid_gate=.20, detection_dedup_iou=.75, min_detection_confidence=.35, min_detection_width=20, min_detection_height=40, min_detection_area=1200, duplicate_track_iou=.70, duplicate_appearance_threshold=.80, identity_face_threshold=.72, identity_body_candidate_threshold=.72, identity_body_confirm_threshold=.84, identity_margin=.08, identity_candidate_min_frames=4, identity_retention_frames=45, identity_lock_timeout=None, recovery_margin=.08, association_min_iou=.01, association_max_scale_change=2.85, gallery_min_detection_confidence=.70):
+    def __init__(self, gallery: Gallery, extractor, face_processor=None, threshold=.75, margin=.15, max_lost_frames=30, min_hits_to_confirm=3, iou_threshold=.3, appearance_weight=.5, w_body=.5, w_face=.5, *, max_occlusion_frames=45, max_recovery_frames=180, max_trajectory_history=30, max_body_gallery=12, max_face_gallery=6, occlusion_iou_threshold=.15, recovery_reid_threshold=.78, motion_gate_threshold=4., recovery_motion_gate=8., turn_threshold=.75, motion_confidence_threshold=.45, gallery_update_threshold=.72, normal_reid_gate=.35, strong_reid_gate=.55, normal_iou_gate=.05, strong_reid_iou_bypass=.70, low_motion_reid_gate=.50, weak_motion_distance=1., detection_dedup_iou=.75, min_detection_confidence=.35, min_detection_width=20, min_detection_height=40, min_detection_area=1200, duplicate_track_iou=.70, duplicate_appearance_threshold=.80, identity_face_threshold=.72, identity_body_candidate_threshold=.72, identity_body_confirm_threshold=.84, identity_margin=.08, identity_candidate_min_frames=4, identity_retention_frames=45, identity_lock_timeout=None, recovery_margin=.10, association_min_iou=.01, association_max_scale_change=2.85, gallery_min_detection_confidence=.70):
         self.gallery, self.extractor, self.face_processor = gallery, extractor, face_processor; self.threshold, self.margin = threshold, margin; self.max_lost_frames, self.min_hits_to_confirm = max_lost_frames, min_hits_to_confirm
         self.iou_threshold, self.appearance_weight, self.w_body, self.w_face = iou_threshold, appearance_weight, w_body, w_face; self.max_occlusion_frames, self.max_recovery_frames = max_occlusion_frames, max_recovery_frames
         self.max_trajectory_history, self.max_body_gallery, self.max_face_gallery = max_trajectory_history, max_body_gallery, max_face_gallery; self.occlusion_iou_threshold, self.recovery_reid_threshold = occlusion_iou_threshold, recovery_reid_threshold
         self.motion_gate_threshold, self.recovery_motion_gate, self.turn_threshold = motion_gate_threshold, recovery_motion_gate, turn_threshold; self.motion_confidence_threshold, self.gallery_update_threshold, self.normal_reid_gate = motion_confidence_threshold, gallery_update_threshold, normal_reid_gate
+        self.strong_reid_gate, self.normal_iou_gate = strong_reid_gate, normal_iou_gate; self.strong_reid_iou_bypass, self.low_motion_reid_gate = strong_reid_iou_bypass, low_motion_reid_gate; self.weak_motion_distance = weak_motion_distance
         self.detection_dedup_iou, self.min_detection_confidence = detection_dedup_iou, min_detection_confidence
         self.min_detection_width, self.min_detection_height, self.min_detection_area = min_detection_width, min_detection_height, min_detection_area
         self.duplicate_track_iou, self.duplicate_appearance_threshold = duplicate_track_iou, duplicate_appearance_threshold
@@ -155,14 +162,46 @@ class ReIDTracker:
         except Exception: body=np.zeros(256,dtype=np.float32)
         face=None
         if self.face_processor is not None and crop.size and crop.shape[0]>=30 and crop.shape[1]>=30:
-            try: _,face=self.face_processor.extract(image[y1:y2,x1:x2])
-            except Exception: pass
+            cached_faces = getattr(self, '_frame_face_results', None)
+            if cached_faces is not None:
+                candidates = []
+                for detected, embedding in cached_faces:
+                    relationship = self._face_bbox_relationship(detected, bbox)
+                    if relationship['face_center_inside'] and relationship['intersection_over_face'] >= .5:
+                        candidates.append((relationship, embedding))
+                if candidates:
+                    face = max(candidates, key=lambda item: (item[0]['intersection_over_face'], item[0]['iou']))[1]
+            else:
+                try: _,face=self.face_processor.extract(image[y1:y2,x1:x2])
+                except Exception: pass
         return body,face
 
     @staticmethod
     def _compute_iou(a,b):
         x1,y1,x2,y2=max(a[0],b[0]),max(a[1],b[1]),min(a[2],b[2]),min(a[3],b[3]); inter=max(0.,x2-x1)*max(0.,y2-y1); union=max(0.,a[2]-a[0])*max(0.,a[3]-a[1])+max(0.,b[2]-b[0])*max(0.,b[3]-b[1])-inter
         return inter/union if union>0 else 0.
+
+    @classmethod
+    def _face_bbox_relationship(cls, face_box, person_box):
+        """Measure how one detected face relates to one person bounding box."""
+        face = np.asarray(face_box, dtype=np.float32)
+        person = np.asarray(person_box, dtype=np.float32)
+        x1, y1 = max(face[0], person[0]), max(face[1], person[1])
+        x2, y2 = min(face[2], person[2]), min(face[3], person[3])
+        intersection = max(0., x2 - x1) * max(0., y2 - y1)
+        face_area = max(0., face[2] - face[0]) * max(0., face[3] - face[1])
+        center_x, center_y = (face[0] + face[2]) / 2, (face[1] + face[3]) / 2
+        return {
+            'iou': cls._compute_iou(face, person),
+            'intersection_over_face': intersection / face_area if face_area else 0.,
+            'face_center_inside': bool(person[0] <= center_x <= person[2] and person[1] <= center_y <= person[3]),
+        }
+
+    @classmethod
+    def _calculate_face_bbox_relationships(cls, face_results, person_boxes):
+        """Calculate relationships for every detected face and person box pair."""
+        return [[cls._face_bbox_relationship(face_box, person_box) for person_box in person_boxes]
+                for face_box, _ in (face_results or [])]
 
     @staticmethod
     def _distance(a,b): return float(np.linalg.norm(Track.centre(a)-Track.centre(b)))
@@ -181,13 +220,17 @@ class ReIDTracker:
     def _prepare_detections(self, detections, shape):
         """Confidence-aware NMS for tracking input; YOLO NMS alone is not enough here."""
         self.debug_counters['detections_raw'] += len(detections)
+        self._record_metric('DETECTION_RAW', count=len(detections))
         valid = [det for det in detections if self._valid_detection(det, shape)]
+        self._record_metric('DETECTIONS_AFTER_CONFIDENCE_FILTER', count=sum(float(getattr(det, 'confidence', 1.)) >= self.min_detection_confidence for det in detections))
+        self._record_metric('DETECTIONS_AFTER_BBOX_FILTER', count=len(valid))
         self.debug_counters['detections_after_filter'] += len(valid)
         kept = []
         for det in sorted(valid, key=lambda item: float(getattr(item, 'confidence', 1.0)), reverse=True):
             box = np.asarray(det.box, dtype=np.float32)
             if all(self._compute_iou(box, np.asarray(other.box, dtype=np.float32)) < self.detection_dedup_iou for other in kept): kept.append(det)
         self.debug_counters['detections_after_dedup'] += len(kept)
+        self._record_metric('DETECTIONS_AFTER_DEDUPLICATION', count=len(kept))
         return kept
 
     def _new_track_conflicts(self, box, body, face):
@@ -218,36 +261,41 @@ class ReIDTracker:
                 logger.debug('Duplicate track removed: canonical=%s duplicate=%s.', winner.tracker_id, loser.tracker_id)
 
     def _passes_association_gates(self, track, box, body, face, recovery=False):
-        """Return a hard-gate rejection reason, or ``None`` for a viable pair."""
+        """Apply explicit hard safety gates before Hungarian assignment."""
         iou=self._compute_iou(track.predicted_bbox,box); distance=self._distance(track.predicted_bbox,box)/self._scale(track.last_reliable_bbox); w=(box[2]-box[0])/max(track.last_reliable_bbox[2]-track.last_reliable_bbox[0],1.); h=(box[3]-box[1])/max(track.last_reliable_bbox[3]-track.last_reliable_bbox[1],1.); app,b,f=self._gallery_similarity(track,body,face)
         gate=self.recovery_motion_gate if recovery else self.motion_gate_threshold*(1+(1-track.motion_confidence)*.75)
         max_scale = self.association_max_scale_change
         if not 1/max_scale<=w<=max_scale or not 1/max_scale<=h<=max_scale:
-            return 'SCALE_GATE_FAIL'
+            return GateResult(False, 'SCALE_GATE_FAIL')
         if distance > gate:
-            return 'MOTION_GATE_FAIL'
+            return GateResult(False, 'MOTION_GATE_FAIL')
         # A completely disjoint box can still be recovered only with strong Re-ID;
         # ordinary association must not bridge arbitrary nearby people.
-        if not recovery and iou < self.association_min_iou and app < self.gallery_update_threshold:
-            return 'IOU_GATE_FAIL'
+        if not recovery and iou < self.association_min_iou and app < self.strong_reid_gate:
+            return GateResult(False, 'IOU_GATE_FAIL')
         if recovery:
-            if b<self.recovery_reid_threshold and f<max(.9,self.recovery_reid_threshold): return None
-            return None
+            if b < self.recovery_reid_threshold and f < max(.9,self.recovery_reid_threshold):
+                return GateResult(False, 'RECOVERY_REID_GATE_FAIL')
+            return GateResult(True)
         # When a usable body descriptor contradicts the track gallery, overlap alone
         # is not enough: that is the common person-to-person occlusion ID-swap case.
-        if self.valid(body) and b < self.normal_reid_gate: return 'REID_THRESHOLD_FAIL'
-        if app<self.normal_reid_gate and iou<self.iou_threshold: return 'NO_SAFE_MATCH'
-        return None
+        body_gate = self.normal_reid_gate + (1 - track.motion_confidence) * (self.low_motion_reid_gate - self.normal_reid_gate)
+        if self.valid(body) and b < body_gate: return GateResult(False, 'REID_GATE_FAIL')
+        if app < body_gate and iou < self.normal_iou_gate and distance > self.weak_motion_distance:
+            return GateResult(False, 'COMBINED_GATE_FAIL')
+        if app < body_gate and iou < self.normal_iou_gate: return GateResult(False, 'NO_SAFE_MATCH')
+        return GateResult(True)
 
     def _compute_association_cost(self, track, box, body, face, recovery=False):
         """Compute availability-aware multi-cue association score after hard gates."""
-        rejection = self._passes_association_gates(track, box, body, face, recovery)
-        if rejection:
-            track.association_reason = rejection
-            self._record_metric('ASSOCIATION_REJECTED', track, rejection_reason=rejection)
-            return None
+        self._record_metric('ASSOCIATION_ATTEMPT', track, detection_id='', track_state=track.state, identity_state=track.identity_state)
+        gate_result = self._passes_association_gates(track, box, body, face, recovery)
         iou=self._compute_iou(track.predicted_bbox,box); distance=self._distance(track.predicted_bbox,box)/self._scale(track.last_reliable_bbox)
         app,b,f=self._gallery_similarity(track,body,face)
+        if not gate_result.accepted:
+            track.association_reason = gate_result.reason
+            self._record_metric('ASSOCIATION_REJECTED', track, iou_score=iou, body_score=b, face_score=f, motion_score=max(0., 1-distance / max(self.motion_gate_threshold, 1e-6)), rejection_reason=gate_result.reason)
+            return None
         gate=self.recovery_motion_gate if recovery else self.motion_gate_threshold*(1+(1-track.motion_confidence)*.75)
         if recovery:
             # Face is strongest when available; body remains a supporting recovery cue.
@@ -273,7 +321,7 @@ class ReIDTracker:
                 alternatives=sorted((value for (row,col),value in scores.items()
                                      if (row == r and col != c) or (col == c and row != r)), reverse=True)
                 if alternatives and score-alternatives[0] < self.recovery_margin:
-                    tracks[r].association_reason = 'REID_MARGIN_FAIL'; self._record_metric('ASSOCIATION_REJECTED', tracks[r], rejection_reason='REID_MARGIN_FAIL'); self._record_metric('RECOVERY_AMBIGUOUS', tracks[r]); ut.append(r); ud.append(c)
+                    tracks[r].association_reason = 'RECOVERY_AMBIGUOUS'; self._record_metric('ASSOCIATION_REJECTED', tracks[r], rejection_reason='RECOVERY_AMBIGUOUS'); self._record_metric('RECOVERY_AMBIGUOUS', tracks[r], best_score=score, second_best_score=alternatives[0], recovery_margin=score-alternatives[0], recovery_result='RECOVERY_AMBIGUOUS', rejection_reason='RECOVERY_AMBIGUOUS'); self._record_metric('RECOVERY_REJECTED', tracks[r], rejection_reason='RECOVERY_AMBIGUOUS'); ut.append(r); ud.append(c)
                 else: safe.append((r,c,score))
             matches=safe
         return matches,ut,ud
@@ -299,13 +347,16 @@ class ReIDTracker:
         """Reserve a confirmed identity while its track is occluded/lost."""
         if track.name == 'Unknown' or track.identity_state not in (IdentityState.CONFIRMED, IdentityState.RETAINED):
             return
-        track.identity_locked = True; track.identity_lock_frame = self.frame_count
+        if not track.identity_locked:
+            track.identity_locked = True; track.identity_lock_frame = self.frame_count
         track.identity_state = IdentityState.RETAINED; track.identity_source = 'IDENTITY_LOCKED'
         self.identity_owners[track.name] = track.tracker_id
         self._record_metric('IDENTITY_LOCKED', track)
 
     def _release_identity_owner(self, track, force=False):
         """Release only after the configured lock lifetime (or explicit expiry)."""
+        if not track.identity_locked and self.identity_owners.get(track.name) != track.tracker_id:
+            return False
         if track.identity_locked and not force and track.identity_lock_frame is not None:
             if self.frame_count - track.identity_lock_frame < self.identity_lock_timeout:
                 return False
@@ -383,17 +434,28 @@ class ReIDTracker:
 
     def update(self,image,detections):
         self.frame_count+=1
+        self._frame_face_results = None
+        if self.face_processor is not None:
+            try:
+                self._frame_face_results = self.face_processor.extract_faces(image)
+            except Exception:
+                logger.debug('Frame-wide face extraction failed; continuing without face evidence.', exc_info=True)
         for t in self.tracks:
-            if t.state!=TrackState.DELETED: t.predict()
+            if t.state!=TrackState.DELETED:
+                t.predict()
+                if t.identity_locked and t.identity_lock_frame is not None and self.frame_count - t.identity_lock_frame >= self.identity_lock_timeout:
+                    self._release_identity_owner(t)
         detections = self._prepare_detections(detections, image.shape)
         boxes=[];bodies=[];faces=[];detection_confidences=[]
         for det in detections:
             box=np.asarray(det.box,dtype=np.float32);body,face=self._extract_embeddings(image,box,det.mask);boxes.append(box);bodies.append(body);faces.append(face);detection_confidences.append(float(getattr(det, 'confidence', 1.)))
+        self._frame_face_bbox_relationships = self._calculate_face_bbox_relationships(self._frame_face_results, boxes)
         normal=[t for t in self.tracks if t.state in (TrackState.TENTATIVE,TrackState.CONFIRMED,TrackState.RECOVERED)]; matches,unmatched,unused=self._associate_detections(normal,boxes,bodies,faces)
         for ti,di,score in matches:
             t=normal[ti]; quality = (score >= self.gallery_update_threshold and detection_confidences[di] >= self.gallery_min_detection_confidence and t.occlusion_frames == 0)
             self._record_metric('TRACK_MATCHED', t, association_score=score, detection_confidence=detection_confidences[di]); self._record_metric('GALLERY_UPDATE_ATTEMPT', t)
-            self._record_metric('GALLERY_UPDATE_ACCEPTED' if quality else 'GALLERY_UPDATE_REJECTED', t)
+            gallery_reason = '' if quality else ('GALLERY_REJECT_LOW_CONFIDENCE' if detection_confidences[di] < self.gallery_min_detection_confidence else 'GALLERY_REJECT_LOW_ASSOCIATION')
+            self._record_metric('GALLERY_UPDATE_ACCEPTED' if quality else 'GALLERY_UPDATE_REJECTED', t, rejection_reason=gallery_reason)
             t.update(boxes[di],bodies[di],faces[di],score,quality,detection_confidence=detection_confidences[di])
             if t.hits>=self.min_hits_to_confirm:
                 if t.state != TrackState.CONFIRMED: self.debug_counters['tracks_confirmed'] += 1
@@ -439,8 +501,7 @@ class ReIDTracker:
             self._record_metric('TRACK_CREATED', created, detection_confidence=detection_confidences[di])
         self._arbitrate_duplicates()
         for t in self.tracks:
-            expiry=max(self.max_recovery_frames, self.identity_lock_timeout if t.identity_locked else 0)
-            if t.state in (TrackState.OCCLUDED,TrackState.LOST) and t.missed_frames>expiry:
+            if t.state in (TrackState.OCCLUDED,TrackState.LOST) and t.missed_frames>self.max_recovery_frames:
                 t.state=TrackState.DELETED;self.debug_counters['tracks_deleted'] += 1;logger.debug('Track %s deleted after recovery/lock lifetime.',t.tracker_id)
                 self._record_metric('TRACK_DELETED', t)
             if t.state == TrackState.DELETED: self._release_identity_owner(t)

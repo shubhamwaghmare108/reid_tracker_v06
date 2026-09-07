@@ -23,7 +23,7 @@ class FaceProcessor:
 
     def extract(self, image: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Detect faces and return the largest face's box and unit-length embedding."""
-        faces = self.app.get(image)
+        faces = self._faces(image)
         if not faces:
             return None, None
         face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
@@ -31,6 +31,19 @@ class FaceProcessor:
         # Unit vectors make a dot product equivalent to cosine similarity.
         emb = face.embedding / np.linalg.norm(face.embedding)
         return bbox, emb
+
+    def _faces(self, image: np.ndarray):
+        return self.app.get(image)
+
+    def extract_faces(self, image: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Detect all faces once for a frame so person crops can reuse the results."""
+        results = []
+        for face in self._faces(image):
+            embedding = face.embedding.astype(np.float32, copy=False)
+            norm = np.linalg.norm(embedding)
+            if norm > 1e-12:
+                results.append((face.bbox.astype(np.float32), embedding / norm))
+        return results
 
     def extract_from_face_crop(self, face_image: np.ndarray) -> np.ndarray | None:
         """

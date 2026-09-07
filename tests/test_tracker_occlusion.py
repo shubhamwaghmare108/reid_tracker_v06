@@ -223,5 +223,71 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(tracker._release_identity_owner(locked))
         self.assertNotIn('alice', tracker.identity_owners)
 
+    def test_identity_lock_frame_does_not_move_during_misses(self):
+        tracker = self.make_identity_tracker(identity_lock_timeout=20)
+        self.feed(tracker, [(10, 10, 50, 100)], [emb(0)])
+        track = tracker.tracks[0]; track.face_embedding = emb(0)
+        tracker._frame_level_identity_assignment()
+        self.feed(tracker, [], [])
+        tracker._lock_identity(track)
+        lock_frame = tracker.frame_count
+        for _ in range(4):
+            self.feed(tracker, [], [])
+        self.assertEqual(track.identity_lock_frame, lock_frame)
+
+    def test_identity_ownership_expires_before_track_recovery_lifetime(self):
+        tracker = self.make_identity_tracker(max_lost_frames=1, max_recovery_frames=8, identity_lock_timeout=2)
+        self.feed(tracker, [(10, 10, 50, 100)], [emb(0)])
+        track = tracker.tracks[0]; track.face_embedding = emb(0)
+        tracker._frame_level_identity_assignment()
+        self.feed(tracker, [], []); self.feed(tracker, [], [])
+        self.assertTrue(track.identity_locked)
+        self.feed(tracker, [], [])
+        self.feed(tracker, [], [])
+        self.assertFalse(track.identity_locked)
+        self.assertNotIn('alice', tracker.identity_owners)
+        self.assertIn(track, tracker.tracks)
+
+    def test_weak_spatial_and_appearance_match_is_rejected(self):
+        tracker = self.make_tracker(normal_reid_gate=.35, normal_iou_gate=.05)
+        track = Track(0, np.array([10, 10, 50, 100], dtype=np.float32), emb(0))
+        track.predicted_bbox = np.array([100, 100, 140, 190], dtype=np.float32)
+        track.motion_confidence = 1.
+        result = tracker._passes_association_gates(track, np.array([150, 150, 190, 240], dtype=np.float32), emb(1), None)
+        self.assertFalse(result.accepted)
+        self.assertIn(result.reason, ('IOU_GATE_FAIL', 'MOTION_GATE_FAIL', 'COMBINED_GATE_FAIL'))
+
+    def test_strong_reid_can_pass_low_iou_with_valid_motion(self):
+        tracker = self.make_tracker(normal_reid_gate=.35, strong_reid_gate=.55, normal_iou_gate=.05)
+        track = Track(0, np.array([10, 10, 50, 100], dtype=np.float32), emb(0))
+        track.predicted_bbox = np.array([12, 10, 52, 100], dtype=np.float32)
+        result = tracker._passes_association_gates(track, np.array([52, 10, 92, 100], dtype=np.float32), emb(0), None)
+        self.assertTrue(result.accepted)
+
+    def test_recovery_margin_rejects_ambiguous_best_candidate(self):
+        tracker = self.make_tracker(recovery_reid_threshold=.65, recovery_margin=.10)
+        track = Track(0, np.array([10, 10, 50, 100], dtype=np.float32), emb(0), state=TrackState.LOST)
+        tracker._compute_association_cost = lambda current, box, body, face, recovery=False: .71 if box[0] == 10 else .69
+        matches, unmatched_tracks, unmatched_detections = tracker._associate_detections(
+            [track], [np.array([10, 10, 50, 100], dtype=np.float32), np.array([20, 10, 60, 100], dtype=np.float32)],
+            [emb(0), emb(0)], [None, None], recovery=True)
+        self.assertEqual(matches, [])
+        self.assertEqual(unmatched_tracks, [0])
+        self.assertEqual(sorted(unmatched_detections), [0, 1])
+
+    def test_face_relationships_cover_every_face_and_person_box(self):
+        tracker = self.make_tracker()
+        face_results = [(np.array([12, 12, 28, 36], dtype=np.float32), emb(0)),
+                        (np.array([120, 20, 140, 48], dtype=np.float32), emb(1))]
+        person_boxes = [np.array([10, 10, 50, 100], dtype=np.float32),
+                        np.array([100, 10, 160, 110], dtype=np.float32),
+                        np.array([200, 10, 250, 110], dtype=np.float32)]
+        relationships = tracker._calculate_face_bbox_relationships(face_results, person_boxes)
+        self.assertEqual(len(relationships), 2)
+        self.assertEqual([len(row) for row in relationships], [3, 3])
+        self.assertTrue(relationships[0][0]['face_center_inside'])
+        self.assertTrue(relationships[1][1]['face_center_inside'])
+        self.assertFalse(relationships[0][2]['face_center_inside'])
+
 
 if __name__ == '__main__': unittest.main()

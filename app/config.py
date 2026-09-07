@@ -66,7 +66,12 @@ class Settings:
     tracker_turn_threshold: float = float(_setting('REID_TRACKER_TURN_THRESHOLD', '0.75'))
     tracker_motion_confidence_threshold: float = float(_setting('REID_TRACKER_MOTION_CONFIDENCE_THRESHOLD', '0.45'))
     tracker_gallery_update_threshold: float = float(_setting('REID_TRACKER_GALLERY_UPDATE_THRESHOLD', '0.72'))
-    tracker_normal_reid_gate: float = float(_setting('REID_TRACKER_NORMAL_REID_GATE', '0.20'))
+    tracker_normal_reid_gate: float = float(_setting('REID_TRACKER_NORMAL_REID_GATE', '0.35'))
+    tracker_strong_reid_gate: float = float(_setting('REID_TRACKER_STRONG_REID_GATE', '0.55'))
+    tracker_normal_iou_gate: float = float(_setting('REID_TRACKER_NORMAL_IOU_GATE', '0.05'))
+    tracker_strong_reid_iou_bypass: float = float(_setting('REID_TRACKER_STRONG_REID_IOU_BYPASS', '0.70'))
+    tracker_low_motion_reid_gate: float = float(_setting('REID_TRACKER_LOW_MOTION_REID_GATE', '0.50'))
+    tracker_weak_motion_distance: float = float(_setting('REID_TRACKER_WEAK_MOTION_DISTANCE', '1.0'))
     tracker_recovery_motion_gate: float = float(_setting('REID_TRACKER_RECOVERY_MOTION_GATE', '8.0'))
     tracker_detection_dedup_iou: float = float(_setting('REID_TRACKER_DETECTION_DEDUP_IOU', '0.75'))
     tracker_min_detection_confidence: float = float(_setting('REID_TRACKER_MIN_DETECTION_CONFIDENCE', '0.35'))
@@ -85,7 +90,7 @@ class Settings:
     # V06: identity ownership outlives a short-lived tracker.  These settings are
     # deliberately additive: the V05 recognition thresholds above are unchanged.
     tracker_identity_lock_timeout: int = int(_setting('REID_TRACKER_IDENTITY_LOCK_TIMEOUT', '180'))
-    tracker_recovery_margin: float = float(_setting('REID_TRACKER_RECOVERY_MARGIN', '0.08'))
+    tracker_recovery_margin: float = float(_setting('REID_TRACKER_RECOVERY_MARGIN', '0.10'))
     tracker_association_min_iou: float = float(_setting('REID_TRACKER_ASSOCIATION_MIN_IOU', '0.01'))
     tracker_association_max_scale_change: float = float(_setting('REID_TRACKER_ASSOCIATION_MAX_SCALE_CHANGE', '2.85'))
     tracker_gallery_min_detection_confidence: float = float(_setting('REID_TRACKER_GALLERY_MIN_DETECTION_CONFIDENCE', '0.70'))
