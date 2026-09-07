@@ -72,6 +72,10 @@ class Settings:
     tracker_strong_reid_iou_bypass: float = float(_setting('REID_TRACKER_STRONG_REID_IOU_BYPASS', '0.70'))
     tracker_low_motion_reid_gate: float = float(_setting('REID_TRACKER_LOW_MOTION_REID_GATE', '0.50'))
     tracker_weak_motion_distance: float = float(_setting('REID_TRACKER_WEAK_MOTION_DISTANCE', '1.0'))
+    # Face/person geometry must clear this score before it can reach tracking.
+    tracker_face_person_min_match_score: float = float(_setting('REID_TRACKER_FACE_PERSON_MIN_MATCH_SCORE', '0.35'))
+    # Two plausible person boxes closer than this score margin are ambiguous.
+    tracker_face_person_ambiguity_margin: float = float(_setting('REID_TRACKER_FACE_PERSON_AMBIGUITY_MARGIN', '0.10'))
     tracker_recovery_motion_gate: float = float(_setting('REID_TRACKER_RECOVERY_MOTION_GATE', '8.0'))
     tracker_detection_dedup_iou: float = float(_setting('REID_TRACKER_DETECTION_DEDUP_IOU', '0.75'))
     tracker_min_detection_confidence: float = float(_setting('REID_TRACKER_MIN_DETECTION_CONFIDENCE', '0.35'))

@@ -59,6 +59,16 @@ class GateResult:
     reason: str = ''
 
 
+@dataclass(frozen=True)
+class FacePersonMatch:
+    face_index: int
+    person_index: int | None
+    score: float
+    margin: float
+    result: str
+    reason: str
+
+
 @dataclass
 class Track:
     tracker_id: int; bbox: np.ndarray; body_embedding: np.ndarray; face_embedding: np.ndarray | None = None
@@ -115,12 +125,13 @@ class Track:
 
 class ReIDTracker:
     """Hungarian multi-cue tracker; long-term recovery is stricter than normal matching."""
-    def __init__(self, gallery: Gallery, extractor, face_processor=None, threshold=.75, margin=.15, max_lost_frames=30, min_hits_to_confirm=3, iou_threshold=.3, appearance_weight=.5, w_body=.5, w_face=.5, *, max_occlusion_frames=45, max_recovery_frames=180, max_trajectory_history=30, max_body_gallery=12, max_face_gallery=6, occlusion_iou_threshold=.15, recovery_reid_threshold=.78, motion_gate_threshold=4., recovery_motion_gate=8., turn_threshold=.75, motion_confidence_threshold=.45, gallery_update_threshold=.72, normal_reid_gate=.35, strong_reid_gate=.55, normal_iou_gate=.05, strong_reid_iou_bypass=.70, low_motion_reid_gate=.50, weak_motion_distance=1., detection_dedup_iou=.75, min_detection_confidence=.35, min_detection_width=20, min_detection_height=40, min_detection_area=1200, duplicate_track_iou=.70, duplicate_appearance_threshold=.80, identity_face_threshold=.72, identity_body_candidate_threshold=.72, identity_body_confirm_threshold=.84, identity_margin=.08, identity_candidate_min_frames=4, identity_retention_frames=45, identity_lock_timeout=None, recovery_margin=.10, association_min_iou=.01, association_max_scale_change=2.85, gallery_min_detection_confidence=.70):
+    def __init__(self, gallery: Gallery, extractor, face_processor=None, threshold=.75, margin=.15, max_lost_frames=30, min_hits_to_confirm=3, iou_threshold=.3, appearance_weight=.5, w_body=.5, w_face=.5, *, max_occlusion_frames=45, max_recovery_frames=180, max_trajectory_history=30, max_body_gallery=12, max_face_gallery=6, occlusion_iou_threshold=.15, recovery_reid_threshold=.78, motion_gate_threshold=4., recovery_motion_gate=8., turn_threshold=.75, motion_confidence_threshold=.45, gallery_update_threshold=.72, normal_reid_gate=.35, strong_reid_gate=.55, normal_iou_gate=.05, strong_reid_iou_bypass=.70, low_motion_reid_gate=.50, weak_motion_distance=1., face_person_min_match_score=.35, face_person_ambiguity_margin=.10, detection_dedup_iou=.75, min_detection_confidence=.35, min_detection_width=20, min_detection_height=40, min_detection_area=1200, duplicate_track_iou=.70, duplicate_appearance_threshold=.80, identity_face_threshold=.72, identity_body_candidate_threshold=.72, identity_body_confirm_threshold=.84, identity_margin=.08, identity_candidate_min_frames=4, identity_retention_frames=45, identity_lock_timeout=None, recovery_margin=.10, association_min_iou=.01, association_max_scale_change=2.85, gallery_min_detection_confidence=.70):
         self.gallery, self.extractor, self.face_processor = gallery, extractor, face_processor; self.threshold, self.margin = threshold, margin; self.max_lost_frames, self.min_hits_to_confirm = max_lost_frames, min_hits_to_confirm
         self.iou_threshold, self.appearance_weight, self.w_body, self.w_face = iou_threshold, appearance_weight, w_body, w_face; self.max_occlusion_frames, self.max_recovery_frames = max_occlusion_frames, max_recovery_frames
         self.max_trajectory_history, self.max_body_gallery, self.max_face_gallery = max_trajectory_history, max_body_gallery, max_face_gallery; self.occlusion_iou_threshold, self.recovery_reid_threshold = occlusion_iou_threshold, recovery_reid_threshold
         self.motion_gate_threshold, self.recovery_motion_gate, self.turn_threshold = motion_gate_threshold, recovery_motion_gate, turn_threshold; self.motion_confidence_threshold, self.gallery_update_threshold, self.normal_reid_gate = motion_confidence_threshold, gallery_update_threshold, normal_reid_gate
         self.strong_reid_gate, self.normal_iou_gate = strong_reid_gate, normal_iou_gate; self.strong_reid_iou_bypass, self.low_motion_reid_gate = strong_reid_iou_bypass, low_motion_reid_gate; self.weak_motion_distance = weak_motion_distance
+        self.face_person_min_match_score, self.face_person_ambiguity_margin = face_person_min_match_score, face_person_ambiguity_margin
         self.detection_dedup_iou, self.min_detection_confidence = detection_dedup_iou, min_detection_confidence
         self.min_detection_width, self.min_detection_height, self.min_detection_area = min_detection_width, min_detection_height, min_detection_area
         self.duplicate_track_iou, self.duplicate_appearance_threshold = duplicate_track_iou, duplicate_appearance_threshold
@@ -207,11 +218,15 @@ class ReIDTracker:
 
     @staticmethod
     def _face_result_box(face_result):
-        return getattr(face_result, 'bbox', face_result[0] if isinstance(face_result, (tuple, list)) else face_result)
+        if hasattr(face_result, 'bbox'):
+            return face_result.bbox
+        return face_result[0] if isinstance(face_result, (tuple, list)) else face_result
 
     @staticmethod
     def _face_result_embedding(face_result):
-        return getattr(face_result, 'embedding', face_result[1] if isinstance(face_result, (tuple, list)) else None)
+        if hasattr(face_result, 'embedding'):
+            return face_result.embedding
+        return face_result[1] if isinstance(face_result, (tuple, list)) else None
 
     @staticmethod
     def _face_result_confidence(face_result):
@@ -225,36 +240,56 @@ class ReIDTracker:
         return .55 * center + .30 * relationship['intersection_over_face'] + .15 * max(0., 1. - upper / .75)
 
     @classmethod
-    def _associate_faces_to_persons(cls, face_results, person_boxes, min_confidence=.0, min_face_size=1., ambiguity_margin=.10):
+    def _associate_faces_to_persons(cls, face_results, person_boxes, min_confidence=.0, min_face_size=1., min_match_score=.35, ambiguity_margin=.10):
         """Assign each face to at most one person, leaving weak or ambiguous faces unassigned."""
         face_results = face_results or []
         relationships = cls._calculate_face_bbox_relationships(face_results, person_boxes)
         candidates = []
+        match_results = []
         for face_index, row in enumerate(relationships):
             valid = []
             face_box = cls._face_result_box(face_results[face_index])
             face_size = min(face_box[2] - face_box[0], face_box[3] - face_box[1])
-            if cls._face_result_confidence(face_results[face_index]) < min_confidence or face_size < min_face_size:
+            face_valid = (np.isfinite(face_box).all() and face_box[2] > face_box[0] and face_box[3] > face_box[1]
+                          and cls._face_result_embedding(face_results[face_index]) is not None
+                          and cls.valid(cls._face_result_embedding(face_results[face_index]))
+                          and cls._face_result_confidence(face_results[face_index]) >= min_confidence
+                          and face_size >= min_face_size)
+            if not face_valid:
+                match_results.append(FacePersonMatch(face_index, None, 0., 0., 'UNASSIGNED', 'FACE_PERSON_INVALID_FACE'))
                 continue
             for person_index, relationship in enumerate(row):
                 score = cls._face_person_score(relationship)
-                if (relationship['face_center_inside'] or relationship['intersection_over_face'] >= .5) and relationship['face_center_y_ratio'] <= .75:
+                if relationship['iou'] > 0. and relationship['face_center_y_ratio'] <= .75:
                     valid.append((score, person_index))
             valid.sort(reverse=True)
-            if valid and (len(valid) == 1 or valid[0][0] - valid[1][0] >= ambiguity_margin):
-                candidates.append((valid[0][0], face_index, valid[0][1]))
+            if not valid:
+                match_results.append(FacePersonMatch(face_index, None, 0., 0., 'UNASSIGNED', 'FACE_PERSON_NO_CANDIDATE'))
+                continue
+            best_score, best_person = valid[0]
+            second_score = valid[1][0] if len(valid) > 1 else 0.
+            margin = best_score - second_score
+            if best_score < min_match_score:
+                match_results.append(FacePersonMatch(face_index, None, best_score, margin, 'UNASSIGNED', 'FACE_PERSON_LOW_SCORE'))
+            elif len(valid) > 1 and margin < ambiguity_margin:
+                match_results.append(FacePersonMatch(face_index, None, best_score, margin, 'UNASSIGNED', 'FACE_PERSON_AMBIGUOUS'))
+            else:
+                candidates.append((best_score, face_index, best_person, margin))
+                match_results.append(FacePersonMatch(face_index, best_person, best_score, margin, 'ACCEPTED', 'FACE_PERSON_ACCEPTED'))
         assignments = {}
         used_persons = set()
-        for _, face_index, person_index in sorted(candidates, reverse=True):
+        accepted_faces = set()
+        for _, face_index, person_index, _ in sorted(candidates, key=lambda item: (-item[0], item[1], item[2])):
             if person_index not in used_persons:
                 assignments[person_index] = cls._face_result_embedding(face_results[face_index])
                 used_persons.add(person_index)
-        ambiguous = 0
-        for row in relationships:
-            valid = sorted(cls._face_person_score(item) for item in row if (item['face_center_inside'] or item['intersection_over_face'] >= .5) and item['face_center_y_ratio'] <= .75)
-            if len(valid) > 1 and valid[-1] - valid[-2] < ambiguity_margin:
-                ambiguous += 1
-        return assignments, relationships, len(candidates), ambiguous, len(face_results) - len(assignments)
+                accepted_faces.add(face_index)
+        for match in match_results:
+            if match.result == 'ACCEPTED' and match.face_index not in accepted_faces:
+                result_index = next(index for index, item in enumerate(match_results) if item is match)
+                match_results[result_index] = FacePersonMatch(match.face_index, None, match.score, match.margin, 'UNASSIGNED', 'FACE_PERSON_PERSON_CONFLICT')
+        ambiguous = sum(match.reason == 'FACE_PERSON_AMBIGUOUS' for match in match_results)
+        return assignments, relationships, match_results, ambiguous, len(face_results) - len(assignments)
 
     @staticmethod
     def _distance(a,b): return float(np.linalg.norm(Track.centre(a)-Track.centre(b)))
@@ -506,12 +541,19 @@ class ReIDTracker:
                     self._release_identity_owner(t)
         detections = self._prepare_detections(detections, image.shape)
         boxes=[np.asarray(det.box,dtype=np.float32) for det in detections]
-        self._frame_face_assignments, self._frame_face_relationships, _, face_ambiguous, face_unassigned = self._associate_faces_to_persons(
-            self._frame_face_results, boxes, min_confidence=.5, min_face_size=8.)
+        self._frame_face_assignments, self._frame_face_relationships, self._frame_face_person_matches, _, face_unassigned = self._associate_faces_to_persons(
+            self._frame_face_results, boxes, min_confidence=.5, min_face_size=8.,
+            min_match_score=self.face_person_min_match_score, ambiguity_margin=self.face_person_ambiguity_margin)
         self._record_metric('FACE_PERSON_MATCH_ATTEMPT', count=len(self._frame_face_results or []) * len(boxes))
         self._record_metric('FACE_PERSON_MATCH', count=len(self._frame_face_assignments))
-        self._record_metric('FACE_PERSON_AMBIGUOUS', count=face_ambiguous)
-        self._record_metric('FACE_PERSON_UNASSIGNED', count=max(0, face_unassigned - face_ambiguous))
+        for item in self._frame_face_person_matches:
+            self._record_metric('FACE_PERSON_RESULT', face_index=item.face_index, person_index=item.person_index,
+                                best_face_person_score=item.score, face_person_margin=item.margin,
+                                face_person_result=item.result, rejection_reason=item.reason)
+            if item.reason != 'FACE_PERSON_ACCEPTED':
+                self._record_metric(item.reason, count=1, face_index=item.face_index, person_index=item.person_index,
+                                    best_face_person_score=item.score, face_person_margin=item.margin)
+        self._record_metric('FACE_PERSON_UNASSIGNED', count=face_unassigned)
         self._frame_detection_index = 0
         bodies=[];faces=[];detection_confidences=[]
         for det, box in zip(detections, boxes):

@@ -297,6 +297,35 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(relationships[1][1]['face_center_inside'])
         self.assertFalse(relationships[0][2]['face_center_inside'])
 
+    def test_face_person_results_distinguish_clear_ambiguous_weak_and_missing(self):
+        tracker = self.make_tracker()
+        person_boxes = [np.array([0, 0, 100, 200], dtype=np.float32), np.array([0, 0, 100, 200], dtype=np.float32)]
+        clear, _, results, _, _ = tracker._associate_faces_to_persons(
+            [(np.array([10, 10, 30, 40], dtype=np.float32), emb(0))], person_boxes,
+            min_match_score=.35, ambiguity_margin=.10)
+        self.assertEqual(results[0].reason, 'FACE_PERSON_AMBIGUOUS')
+        self.assertEqual(clear, {})
+        weak, _, results, _, _ = tracker._associate_faces_to_persons(
+            [(np.array([99, 10, 119, 30], dtype=np.float32), emb(0))], [person_boxes[0]],
+            min_match_score=.35)
+        self.assertEqual(results[0].reason, 'FACE_PERSON_LOW_SCORE')
+        self.assertEqual(weak, {})
+        missing, _, results, _, _ = tracker._associate_faces_to_persons(
+            [(np.array([150, 10, 170, 30], dtype=np.float32), emb(0))], [person_boxes[0]],
+            min_match_score=.35)
+        self.assertEqual(results[0].reason, 'FACE_PERSON_NO_CANDIDATE')
+        self.assertEqual(missing, {})
+
+    def test_face_person_conflict_keeps_strongest_face(self):
+        tracker = self.make_tracker()
+        faces = [(np.array([10, 10, 40, 50], dtype=np.float32), emb(0)),
+                 (np.array([20, 20, 60, 70], dtype=np.float32), emb(1))]
+        assignments, _, results, _, _ = tracker._associate_faces_to_persons(
+            faces, [np.array([0, 0, 100, 200], dtype=np.float32)], min_match_score=.35)
+        self.assertEqual(list(assignments), [0])
+        self.assertEqual(results[0].reason, 'FACE_PERSON_ACCEPTED')
+        self.assertEqual(results[1].reason, 'FACE_PERSON_PERSON_CONFLICT')
+
     def test_frame_face_api_runs_once_and_reaches_person_track(self):
         face_processor = FrameFaceProcessor()
         tracker = ReIDTracker(EmptyGallery(), DummyExtractor(), face_processor=face_processor, min_hits_to_confirm=1)

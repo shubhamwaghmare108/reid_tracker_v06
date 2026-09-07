@@ -1,0 +1,399 @@
+V06.1 — FACE-PERSON AMBIGUITY HANDLING HARDENING
+
+Repository:
+https://github.com/shubhamwaghmare108/reid_tracker_v06.git
+
+TASK:
+Audit and improve the FACE → PERSON association ambiguity handling.
+
+IMPORTANT:
+Do NOT redesign the tracker.
+Do NOT change PERSON → TRACK Hungarian association.
+Do NOT change identity confirmation thresholds.
+Do NOT change the frame-level face inference optimization.
+Do NOT change identity ownership logic.
+Do NOT change gallery protection.
+
+The architecture must remain:
+
+FRAME
+ ├── Person detection → P1, P2, P3...
+ └── Face inference ONCE → F1, F2, F3...
+             ↓
+       FACE → PERSON
+             ↓
+       PERSON → TRACK
+             ↓
+          IDENTITY
+
+1. MINIMUM FACE-PERSON MATCH SCORE
+
+Add a configurable threshold:
+
+    FACE_PERSON_MIN_MATCH_SCORE = 0.35
+
+Do not accept a candidate merely because it is the highest score.
+
+If all candidates are below the threshold:
+
+    FACE → UNASSIGNED
+    reason = FACE_PERSON_LOW_SCORE
+
+2. AMBIGUITY MARGIN
+
+For each face:
+
+    best = highest valid candidate
+    second = second-highest valid candidate
+    margin = best.score - second.score
+
+Add:
+
+    FACE_PERSON_AMBIGUITY_MARGIN = 0.10
+
+If two valid candidates exist and:
+
+    margin < FACE_PERSON_AMBIGUITY_MARGIN
+
+then:
+
+    FACE → UNASSIGNED
+    reason = FACE_PERSON_AMBIGUOUS
+
+Example:
+
+    P1 = 0.71
+    P2 = 0.67
+
+Result:
+
+    UNASSIGNED
+
+Do not force P1.
+
+3. DISTINGUISH WEAK FROM AMBIGUOUS
+
+Weak:
+
+    P1 = 0.25
+    P2 = 0.10
+
+Result:
+
+    FACE_PERSON_LOW_SCORE
+
+Ambiguous:
+
+    P1 = 0.71
+    P2 = 0.67
+
+Result:
+
+    FACE_PERSON_AMBIGUOUS
+
+Clear:
+
+    P1 = 0.82
+    P2 = 0.45
+
+Result:
+
+    FACE_PERSON_ACCEPTED
+
+4. NO VALID CANDIDATE
+
+If no valid person candidate exists:
+
+    FACE → UNASSIGNED
+    reason = FACE_PERSON_NO_CANDIDATE
+
+Never assign to the nearest person merely because no valid candidate exists.
+
+5. SINGLE VALID CANDIDATE
+
+If exactly one valid candidate exists:
+
+    score >= minimum → ACCEPT
+    score < minimum  → LOW_SCORE
+
+No ambiguity margin is required for a single valid candidate.
+
+6. MULTIPLE FACES CANNOT SHARE ONE PERSON
+
+Each person detection should normally receive at most one face.
+
+Example:
+
+    F1 → P1 = 0.80
+    F2 → P1 = 0.72
+
+Expected:
+
+    F1 → P1
+    F2 → UNASSIGNED / CONFLICT
+
+The strongest valid match wins.
+
+Use deterministic matching.
+
+7. ONE FACE CANNOT BE ASSIGNED TO MULTIPLE PEOPLE
+
+Each face must have zero or one person assignment.
+
+Assignments must be deterministic.
+
+8. CLEAR RESULT REPRESENTATION
+
+Use a clear structure such as:
+
+    FacePersonMatch:
+        face_index
+        person_index
+        score
+        margin
+        result
+        reason
+
+Possible results:
+
+    ACCEPTED
+    UNASSIGNED
+
+Possible reasons:
+
+    FACE_PERSON_ACCEPTED
+    FACE_PERSON_LOW_SCORE
+    FACE_PERSON_AMBIGUOUS
+    FACE_PERSON_NO_CANDIDATE
+    FACE_PERSON_PERSON_CONFLICT
+    FACE_PERSON_INVALID_FACE
+    FACE_PERSON_INVALID_PERSON
+
+Avoid ambiguous None/False semantics.
+
+9. METRICS
+
+Add/verify:
+
+    face_person_match_attempts
+    face_person_matches
+    face_person_ambiguous
+    face_person_low_score
+    face_person_no_candidate
+    face_person_person_conflict
+    face_person_unassigned
+
+Do not double-count mutually exclusive result categories.
+
+Also record when available:
+
+    best_face_person_score
+    second_best_face_person_score
+    face_person_margin
+
+CSV events should contain enough information for forensic analysis.
+
+10. AMBIGUOUS FACE MUST NOT REACH IDENTITY LOGIC
+
+If:
+
+    F1 → AMBIGUOUS
+
+then F1 must NOT provide face identity evidence to any person or track.
+
+Do not allow ambiguous face evidence to influence:
+
+    identity confirmation
+    identity retention
+    identity ownership
+    face gallery update
+
+Body tracking must continue normally.
+
+11. MISSING FACE MUST NOT BREAK BODY TRACKING
+
+If a person has no usable face, PERSON → TRACK must continue using:
+
+    body Re-ID
+    IoU
+    motion
+    Kalman prediction
+
+Face evidence is optional.
+
+12. FACE QUALITY
+
+Reject or leave unassigned:
+
+    invalid face bbox
+    invalid embedding
+    extremely small face
+    unusable confidence
+
+Do not allow poor-quality observations to contaminate the face gallery.
+
+13. DO NOT REINTRODUCE PER-PERSON FACE INFERENCE
+
+Face inference must remain ONCE PER FRAME.
+
+Do not call the face model again inside FACE → PERSON matching.
+
+Face-person matching must be geometric/scoring logic only.
+
+14. TESTS — MANDATORY
+
+Add tests for:
+
+TEST 1 — Clear match
+    F1 → P1 = 0.82
+    F1 → P2 = 0.45
+    Expected: F1 → P1, FACE_PERSON_ACCEPTED
+
+TEST 2 — Ambiguous match
+    F1 → P1 = 0.71
+    F1 → P2 = 0.67
+    Expected: F1 → UNASSIGNED, FACE_PERSON_AMBIGUOUS
+
+TEST 3 — Weak match
+    F1 → P1 = 0.25
+    F1 → P2 = 0.10
+    Expected: F1 → UNASSIGNED, FACE_PERSON_LOW_SCORE
+
+TEST 4 — No candidate
+    Expected: FACE_PERSON_NO_CANDIDATE
+
+TEST 5 — Single valid candidate
+    F1 → P1 = 0.60
+    Expected: F1 → P1
+
+TEST 6 — Multiple faces competing for one person
+    F1 → P1 = 0.80
+    F2 → P1 = 0.72
+    Expected: strongest valid face wins; weaker face is unassigned/conflict
+
+TEST 7 — Three people / three faces
+    Expected: F1 → P1, F2 → P2, F3 → P3
+
+TEST 8 — Three people / two faces
+    Expected: two valid assignments; one person has no face
+
+TEST 9 — Ambiguous face does not reach identity logic
+    Expected: no face confirmation, no face gallery update, body tracking continues
+
+TEST 10 — No face
+    Expected: body tracking continues normally
+
+TEST 11 — Determinism
+    Run identical inputs multiple times.
+    Expected: identical assignments every time.
+
+TEST 12 — Existing tests
+    ALL existing tests must continue passing.
+    Do NOT delete or weaken tests.
+
+15. CONFIGURATION
+
+Add:
+
+    FACE_PERSON_MIN_MATCH_SCORE = 0.35
+    FACE_PERSON_AMBIGUITY_MARGIN = 0.10
+
+Use the existing Settings/config pattern.
+Do not hard-code these values in tracker.py.
+Document both thresholds.
+
+16. PERFORMANCE
+
+Verify:
+
+    face inference calls ≈ 1 per frame
+
+Do not perform additional face-model inference during matching.
+
+Record:
+
+    face_inference_calls
+    face_person_match_attempts
+    face_person_matches
+    face_person_ambiguous
+    face_person_low_score
+    face_person_no_candidate
+    face_person_person_conflict
+
+17. VALIDATION
+
+Run:
+
+    pytest -q
+
+All existing tests must pass.
+
+Report:
+
+    old test count
+    new test count
+    passed
+    failed
+
+Run synthetic cases for:
+
+    1 person / 1 face
+    3 people / 3 faces
+    3 people / 2 faces
+    overlapping people
+    ambiguous face
+    tiny face
+    no face
+
+Then run V08 and V09 if available.
+
+Compare:
+
+    face_person_matches
+    face_person_ambiguous
+    face_person_low_score
+    face_person_no_candidate
+    identity_confirmations
+    identity_owner_conflicts
+    ID switches
+    track fragments
+    recovery success
+    recovery ambiguous
+
+Do not tune thresholds based solely on visual inspection.
+
+18. FINAL REPORT
+
+Return:
+
+1. Files modified
+2. Exact face-person matching changes
+3. New configuration parameters
+4. Ambiguity logic
+5. Weak-match logic
+6. Face-person conflict handling
+7. Metrics added/changed
+8. Tests added
+9. Total tests passed
+10. Whether all existing tests remain green
+11. V08/V09 comparison if videos are available
+12. Remaining edge cases
+
+FINAL PRINCIPLE:
+
+Never convert:
+
+    "best available candidate"
+
+into:
+
+    "correct candidate"
+
+unless the candidate is sufficiently strong AND clearly better than
+the alternatives.
+
+When uncertain:
+
+    FACE → UNASSIGNED
+
+is the correct behavior.

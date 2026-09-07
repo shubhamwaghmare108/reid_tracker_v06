@@ -68,6 +68,8 @@ class ReIDPipeline:
             strong_reid_iou_bypass=settings.tracker_strong_reid_iou_bypass,
             low_motion_reid_gate=settings.tracker_low_motion_reid_gate,
             weak_motion_distance=settings.tracker_weak_motion_distance,
+            face_person_min_match_score=settings.tracker_face_person_min_match_score,
+            face_person_ambiguity_margin=settings.tracker_face_person_ambiguity_margin,
             detection_dedup_iou=settings.tracker_detection_dedup_iou,
             min_detection_confidence=settings.tracker_min_detection_confidence,
             min_detection_width=settings.tracker_min_detection_width,
@@ -248,5 +250,6 @@ class ReIDPipeline:
                 'tracker_recovery_reid_threshold', 'tracker_recovery_margin', 'tracker_identity_lock_timeout',
             'tracker_gallery_update_threshold', 'tracker_identity_candidate_min_frames', 'tracker_max_occlusion_frames',
             'tracker_normal_reid_gate', 'tracker_strong_reid_gate', 'tracker_normal_iou_gate',
-            'tracker_strong_reid_iou_bypass')
+                'tracker_strong_reid_iou_bypass', 'tracker_face_person_min_match_score',
+                'tracker_face_person_ambiguity_margin')
         return {key: getattr(self.settings, key) for key in keys}
