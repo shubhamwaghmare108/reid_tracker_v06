@@ -239,27 +239,28 @@ class ReIDTracker:
         upper = relationship['face_center_y_ratio']
         return .55 * center + .30 * relationship['intersection_over_face'] + .15 * max(0., 1. - upper / .75)
 
-    @classmethod
-    def _associate_faces_to_persons(cls, face_results, person_boxes, min_confidence=.0, min_face_size=1., min_match_score=.35, ambiguity_margin=.10):
+    def _associate_faces_to_persons(self, face_results, person_boxes, min_confidence=.0, min_face_size=1., min_match_score=None, ambiguity_margin=None):
         """Assign each face to at most one person, leaving weak or ambiguous faces unassigned."""
         face_results = face_results or []
-        relationships = cls._calculate_face_bbox_relationships(face_results, person_boxes)
+        min_match_score = self.face_person_min_match_score if min_match_score is None else min_match_score
+        ambiguity_margin = self.face_person_ambiguity_margin if ambiguity_margin is None else ambiguity_margin
+        relationships = self._calculate_face_bbox_relationships(face_results, person_boxes)
         candidates = []
         match_results = []
         for face_index, row in enumerate(relationships):
             valid = []
-            face_box = cls._face_result_box(face_results[face_index])
+            face_box = self._face_result_box(face_results[face_index])
             face_size = min(face_box[2] - face_box[0], face_box[3] - face_box[1])
             face_valid = (np.isfinite(face_box).all() and face_box[2] > face_box[0] and face_box[3] > face_box[1]
-                          and cls._face_result_embedding(face_results[face_index]) is not None
-                          and cls.valid(cls._face_result_embedding(face_results[face_index]))
-                          and cls._face_result_confidence(face_results[face_index]) >= min_confidence
+                          and self._face_result_embedding(face_results[face_index]) is not None
+                          and self.valid(self._face_result_embedding(face_results[face_index]))
+                          and self._face_result_confidence(face_results[face_index]) >= min_confidence
                           and face_size >= min_face_size)
             if not face_valid:
                 match_results.append(FacePersonMatch(face_index, None, 0., 0., 'UNASSIGNED', 'FACE_PERSON_INVALID_FACE'))
                 continue
             for person_index, relationship in enumerate(row):
-                score = cls._face_person_score(relationship)
+                score = self._face_person_score(relationship)
                 if relationship['iou'] > 0. and relationship['face_center_y_ratio'] <= .75:
                     valid.append((score, person_index))
             valid.sort(reverse=True)
@@ -281,7 +282,7 @@ class ReIDTracker:
         accepted_faces = set()
         for _, face_index, person_index, _ in sorted(candidates, key=lambda item: (-item[0], item[1], item[2])):
             if person_index not in used_persons:
-                assignments[person_index] = cls._face_result_embedding(face_results[face_index])
+                assignments[person_index] = self._face_result_embedding(face_results[face_index])
                 used_persons.add(person_index)
                 accepted_faces.add(face_index)
         for match in match_results:

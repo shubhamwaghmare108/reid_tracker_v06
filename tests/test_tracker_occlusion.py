@@ -326,6 +326,14 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(results[0].reason, 'FACE_PERSON_ACCEPTED')
         self.assertEqual(results[1].reason, 'FACE_PERSON_PERSON_CONFLICT')
 
+    def test_configured_face_person_minimum_is_enforced_by_association_api(self):
+        tracker = self.make_tracker(face_person_min_match_score=.99)
+        assignments, _, results, _, _ = tracker._associate_faces_to_persons(
+            [(np.array([10, 10, 30, 40], dtype=np.float32), emb(0))],
+            [np.array([0, 0, 100, 200], dtype=np.float32)])
+        self.assertEqual(assignments, {})
+        self.assertEqual(results[0].reason, 'FACE_PERSON_LOW_SCORE')
+
     def test_frame_face_api_runs_once_and_reaches_person_track(self):
         face_processor = FrameFaceProcessor()
         tracker = ReIDTracker(EmptyGallery(), DummyExtractor(), face_processor=face_processor, min_hits_to_confirm=1)
