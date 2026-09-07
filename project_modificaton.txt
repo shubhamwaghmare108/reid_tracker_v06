@@ -1,0 +1,634 @@
+Continue modifying the existing reid_tracker_v03 project.
+
+IMPORTANT:
+The occlusion-aware tracker, Re-ID recovery, state machine, galleries, adaptive Kalman logic, visual diagnostics, configuration, and existing tests are already implemented.
+
+DO NOT redesign those systems yet.
+
+The current real-video evaluation shows a more fundamental problem:
+
+Severe track fragmentation.
+The same seated person receives multiple IDs.
+Duplicate/overlapping detections create parallel tentative tracks.
+Occlusion logic preserves false duplicate tracks.
+Many stale OCCLUDED predictions remain visible.
+Attendance generates false IN/OUT churn.
+The known identity "shubham" is recognized correctly, but duplicate tracks remain around the same person.
+
+The priority is now:
+
+DETECTION DEDUPLICATION
+↓
+NEW-TRACK CREATION GATING
+↓
+DUPLICATE-TRACK ARBITRATION
+↓
+TRACK LIFECYCLE CLEANUP
+↓
+ATTENDANCE STABILITY
+
+Only after these are fixed should Re-ID recovery thresholds be reconsidered.
+
+==================================================
+
+FIRST INSPECT THE EXISTING CODE
+==================================================
+
+Before changing anything inspect:
+
+app/core/tracker.py
+app/core/pipeline.py
+app/core/detector.py
+app/core/presence.py
+app/config.py
+app/utils/utils.py
+existing tracker tests
+any detector configuration
+YOLO inference/NMS configuration
+
+Trace the complete path:
+
+YOLO output
+→ detection filtering
+→ detection preprocessing
+→ tracker update
+→ unmatched detections
+→ new Track creation
+→ presence/attendance events
+
+Identify exactly where duplicate detections and duplicate tracks enter the system.
+
+Do not assume the root cause without inspecting the implementation.
+
+Implement a tracker-input detection deduplication stage if one does not already exist.
+
+Important distinction:
+
+YOLO/NMS suppresses overlapping boxes for the SAME detection class.
+
+It does not necessarily solve all duplicate detections that become problematic for tracking.
+
+Before detections are allowed into the tracker:
+
+Remove detections below the configured person confidence threshold.
+Remove invalid/degenerate bounding boxes.
+Apply an additional person-detection deduplication step if necessary.
+Ensure highly overlapping detections representing the same person do not enter tracking as independent candidates.
+
+Use confidence-aware suppression.
+
+For duplicate boxes:
+
+Prefer the higher-confidence detection.
+Preserve the best-quality detection.
+Do not keep several nearly identical person boxes merely because they survived detector NMS.
+
+Make thresholds configurable.
+
+Do NOT blindly use an extremely aggressive IoU threshold because legitimate nearby people may overlap.
+
+Before a detection can create a new track, validate:
+
+confidence
+bounding-box area
+minimum width
+minimum height
+aspect ratio
+image-boundary conditions where appropriate
+optional segmentation/body quality if already available
+
+Reject clearly invalid detections.
+
+Do not invent arbitrary values without checking the existing video resolution and detector behavior.
+
+Prefer configuration values in Settings.
+
+This is the most important change.
+
+An unmatched detection must NOT automatically become a new track.
+
+Current conceptual behavior may be:
+
+detection unmatched
+↓
+create Track
+
+Change this to:
+
+detection unmatched
+↓
+check active tracks
+↓
+check tentative tracks
+↓
+check OCCLUDED tracks
+↓
+check LOST/recovery candidates
+↓
+check duplicate spatial candidates
+↓
+only then create NEW track
+
+A new track should require sufficient evidence.
+
+Strengthen the tentative-track lifecycle.
+
+A single weak detection should not immediately become a confirmed identity.
+
+Use the existing state machine.
+
+Conceptually:
+
+NEW detection
+↓
+TENTATIVE
+↓
+must be observed consistently
+↓
+CONFIRMED
+
+Require configurable evidence such as:
+
+minimum hits
+observations across multiple frames
+reasonable motion continuity
+no strong conflict with an existing confirmed track
+
+Do not allow multiple tentative tracks to accumulate around the same person.
+
+Implement explicit duplicate-track detection.
+
+At every appropriate tracker update, identify active tracks that are likely representing the same physical person.
+
+Signals may include:
+
+high IoU
+center distance
+similar size
+similar body Re-ID embedding
+similar face embedding when available
+similar trajectory
+same identity/name
+one track being tentative while another is confirmed
+
+If two tracks represent the same person:
+
+PREFER:
+
+confirmed over tentative
+higher hit count
+longer stable history
+stronger identity evidence
+better confidence
+better-quality appearance gallery
+
+Then retire/merge the weaker duplicate.
+
+Do NOT arbitrarily merge two legitimate nearby people merely because their boxes overlap.
+
+Use multiple cues.
+
+Establish a single canonical Track ID for one physical person.
+
+Invariant:
+
+ONE PERSON
+↓
+ONE ACTIVE CANONICAL TRACK ID
+
+Temporary states:
+
+CONFIRMED
+→ OCCLUDED
+→ LOST
+→ RECOVERED
+
+must preserve the same canonical ID.
+
+Do not allow:
+
+ID 0
+→ OCCLUDED
+
+while simultaneously creating:
+
+ID 7
+→ same person
+
+unless there is strong evidence that they are genuinely different people.
+
+For an unmatched detection, use this priority:
+
+Match active confirmed tracks
+Recover OCCLUDED tracks
+Recover eligible LOST tracks
+Resolve duplicate/competing candidates
+Only then create a new track
+
+This ordering is critical.
+
+Do NOT create a new ID first and attempt Re-ID recovery afterward.
+
+The current video shows too many stale OCCLUDED boxes.
+
+Separate:
+
+INTERNAL TRACK MEMORY
+from
+VISUAL PREDICTION DISPLAY.
+
+An occluded track can remain internally recoverable without drawing its predicted box forever.
+
+Only draw the predicted box while:
+
+uncertainty is below configured threshold
+occlusion duration is relatively short
+predicted location remains meaningful
+
+After uncertainty becomes too high:
+
+State may remain:
+
+OCCLUDED / LOST
+
+but:
+
+do not draw a misleading predicted bounding box.
+
+The identity should remain in memory for recovery.
+
+Occlusion ownership must never be used to justify keeping duplicate tracks indefinitely.
+
+Example:
+
+ID 0 = real seated person
+ID 7 = duplicate false track around same person
+
+If ID 7 has no independent evidence of being a real person:
+
+do not allow:
+
+ID 7 → OCCLUDED → OCCLUDED → OCCLUDED
+
+forever.
+
+Before entering OCCLUDED, verify that the track was a legitimate confirmed track or has sufficient history.
+
+A weak tentative track should generally be discarded rather than preserved as an occluded identity.
+
+If:
+
+Track A = CONFIRMED
+Track B = TENTATIVE
+
+and both occupy essentially the same person region:
+
+prefer Track A.
+
+Track B should not become a competing identity.
+
+Similarly:
+
+Track A = OCCLUDED but strong historical identity
+Track B = newly created tentative track
+
+Do not allow B to steal the identity.
+
+Inspect app/core/presence.py and the pipeline interaction.
+
+The current output shows approximately:
+
+6 IN
+5 OUT
+
+in only 8.4 seconds.
+
+This is clearly unstable.
+
+Do not treat every temporary track creation/deletion as a real person entry/exit.
+
+Attendance events must be tied to a stable canonical identity/track lifecycle.
+
+For example:
+
+Track creation:
+does NOT automatically mean person entered
+
+Track deletion:
+does NOT automatically mean person exited
+
+Require stable spatial/temporal evidence appropriate to the existing application.
+
+A temporary occlusion must NEVER generate:
+
+OUT
+then
+IN
+
+for the same person.
+
+Inspect existing presence logic.
+
+If there are repeated transitions caused by:
+
+ID0 disappears
+ID7 appears
+ID11 appears
+
+representing the same physical person:
+
+do not generate multiple attendance events.
+
+Add appropriate temporal debouncing/state logic.
+
+Preserve the existing application semantics.
+
+Do not completely disable attendance detection.
+
+When Re-ID/face recognition strongly identifies:
+
+"shubham"
+
+do not allow weak duplicate tracks around that person to replace the canonical identity.
+
+Identity assignment should be stable.
+
+However, do NOT simply force all nearby detections to "shubham".
+
+Use:
+
+Re-ID similarity
+face evidence
+spatial consistency
+track history
+detection quality
+
+The desired processing order is:
+
+YOLO
+↓
+confidence filtering
+↓
+detection deduplication
+↓
+feature extraction
+↓
+prediction
+↓
+hard gates
+↓
+active-track association
+↓
+occluded-track recovery
+↓
+lost-track recovery
+↓
+duplicate-track arbitration
+↓
+new-track creation
+↓
+gallery update
+↓
+presence/attendance
+
+Do not create new tracks before recovery and duplicate checks have completed.
+
+Do NOT attempt to solve the current problem simply by:
+
+increasing Re-ID threshold
+decreasing Re-ID threshold
+changing embedding model
+adding another Re-ID model
+
+The current evidence indicates that duplicate detections and premature new-track creation are upstream problems.
+
+Keep the existing Re-ID system unless a concrete bug is discovered.
+
+Add tests for:
+
+TEST 1:
+Two highly overlapping detections for one person
+→ only one tracking candidate.
+
+TEST 2:
+High-confidence box + low-confidence duplicate
+→ keep high-confidence detection.
+
+TEST 3:
+Confirmed track + duplicate tentative detection
+→ confirmed track wins.
+
+TEST 4:
+Occluded confirmed track + reappearing detection
+→ recover existing ID, do not create new ID.
+
+TEST 5:
+Weak unmatched detection
+→ remains tentative or rejected, depending on existing design.
+
+TEST 6:
+Two legitimate nearby people
+→ do NOT merge them.
+
+TEST 7:
+One person approaches camera and bounding box becomes much larger
+→ do not create duplicate identity merely because scale changes.
+
+TEST 8:
+Person turns during occlusion
+→ recovery preserves canonical ID.
+
+TEST 9:
+Temporary occlusion
+→ no false OUT/IN attendance events.
+
+TEST 10:
+Repeated weak detections around a chair/background
+→ no accumulation of stale tracks.
+
+TEST 11:
+Duplicate confirmed tracks
+→ weaker duplicate is retired/merged safely.
+
+TEST 12:
+Long-lived OCCLUDED track
+→ remains internally recoverable but predicted visualization eventually disappears.
+
+After unit tests pass, run the same 8.4-second / 252-frame test video used for the previous evaluation.
+
+Compare before vs after:
+
+number of unique IDs
+ID switches
+track fragmentation
+number of simultaneous tracks
+number of OCCLUDED tracks
+number of new tracks
+number of recovered tracks
+attendance IN count
+attendance OUT count
+
+Pay particular attention to the seated person.
+
+Expected behavior:
+
+Seated person:
+one canonical ID
+remains stable
+no 0 → 1 → 7 → 11 fragmentation
+
+Foreground person:
+one canonical identity when evidence supports it
+temporary occlusion handled without duplicate IDs
+
+Attendance:
+no rapid false IN/OUT churn
+
+If practical, add debug counters:
+
+detections_raw
+detections_after_filter
+detections_after_dedup
+tracks_created
+tracks_confirmed
+tracks_occluded
+tracks_recovered
+tracks_lost
+tracks_deleted
+duplicate_tracks_removed
+recovery_attempts
+recovery_successes
+recovery_failures
+
+These counters are extremely useful for diagnosing the next iteration.
+
+Display them only in debug mode.
+
+Keep the solution real-time.
+
+Avoid expensive all-to-all Re-ID comparisons when simple spatial/detection gates can eliminate candidates first.
+
+Use:
+
+detection filtering
+→ geometry gating
+→ Re-ID comparison
+
+where appropriate.
+
+Keep all galleries and histories bounded.
+
+Run:
+
+pytest -q
+
+Run Python compilation checks.
+
+Verify:
+
+Settings load
+.env overrides
+tracker import
+pipeline import
+presence system
+Streamlit import if possible
+
+Then run the real tracking video.
+
+Do not claim production-ready merely because unit tests pass.
+
+Update the project modification document with:
+
+IMPLEMENTED
+VERIFIED
+REMAINING LIMITATIONS
+
+Only mark items verified if they were actually tested.
+
+Return:
+
+Root cause discovered
+Files changed
+Detection deduplication logic
+New-track gating logic
+Duplicate-track arbitration logic
+Occlusion cleanup logic
+Attendance stabilization logic
+Tests added
+Test results
+Real-video results
+Before/after ID count
+Before/after fragmentation
+Before/after attendance churn
+Remaining issues
+
+Most important acceptance criterion:
+
+For one physical person, the tracker must maintain ONE canonical Track ID through:
+
+normal visibility
+→ partial occlusion
+→ complete/temporary occlusion
+→ movement/turning
+→ reappearance
+
+without creating competing duplicate tracks.
+
+==================================================
+IMPLEMENTATION STATUS (2026-09-07)
+==================================================
+
+IMPLEMENTED
+
+* Confidence-aware tracker-input detection filtering and duplicate suppression.
+* New-track creation gates for invalid and competing spatial detections.
+* Duplicate-track arbitration for an overlapping tentative duplicate with
+  appearance evidence; a confirmed/canonical track wins.
+* Fast tentative-track expiry, debug counters, bounded occlusion visualization,
+  and known-person attendance continuity through short occlusions.
+* Environment-configurable thresholds documented in .env.example.
+
+VERIFIED
+
+* 15 unit tests pass using my_tracker_project, including duplicate detection,
+  low-confidence rejection, tentative-duplicate arbitration, nearby-person
+  preservation, and recovery without a new ID.
+* Python compilation plus Settings, tracker, and pipeline imports pass.
+
+REMAINING LIMITATION
+
+* The available 252-frame evaluation file is already annotated output, not the
+  original camera source. Its full headless reprocessing was CPU-intensive and
+  stopped before completion. Re-run against the original video/camera source
+  for before/after ID, fragmentation, and attendance metrics.
+
+==================================================
+V04 IDENTITY HARDENING STATUS (2026-09-07)
+==================================================
+
+IMPLEMENTED
+
+* IdentityState is independent of the tracking state: UNKNOWN, CANDIDATE,
+  CONFIRMED, and RETAINED.
+* Face evidence is the one-frame confirmation path. Body-only evidence must be
+  high, unambiguous, and consistent for multiple frames before confirmation.
+* Canonical identity ownership prevents a second track from claiming an enrolled
+  identity on body-only evidence; UNKNOWN is preferred when evidence conflicts.
+* Confirmed identity is retained across short face loss/recovery, expires after
+  a configurable retention window, and is released when the owner is deleted.
+* Enrollment gallery remains immutable; only bounded runtime track galleries are
+  updated by tracking logic.
+
+VERIFIED
+
+* 20 unit tests pass, including strong face confirmation, body-only candidate
+  rejection, repeated body evidence, canonical-owner protection, and retention.
+* Compilation and identity-related Settings environment override pass.
+
+REMAINING LIMITATION
+
+* Face quality metadata is not exposed by the current FaceProcessor interface,
+  so its existing valid-embedding and similarity/margin gates are used. Raw
+  source-video validation is still required before reporting real-world metrics.
+
+Do not optimize for passing synthetic tests alone. The same real video that exposed the 0 → 1 → 7 → 11 fragmentation must be used for validation.
