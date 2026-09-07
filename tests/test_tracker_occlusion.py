@@ -26,6 +26,14 @@ class DummyExtractor:
     def extract(self, image): return emb(0)
 
 
+class FrameFaceProcessor:
+    def __init__(self): self.calls = 0
+
+    def extract_faces(self, image):
+        self.calls += 1
+        return [(np.array([15, 15, 35, 40], dtype=np.float32), emb(0))]
+
+
 def detection(box, confidence=1.0): return SimpleNamespace(box=box, confidence=confidence, mask=None)
 
 
@@ -288,6 +296,13 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(relationships[0][0]['face_center_inside'])
         self.assertTrue(relationships[1][1]['face_center_inside'])
         self.assertFalse(relationships[0][2]['face_center_inside'])
+
+    def test_frame_face_api_runs_once_and_reaches_person_track(self):
+        face_processor = FrameFaceProcessor()
+        tracker = ReIDTracker(EmptyGallery(), DummyExtractor(), face_processor=face_processor, min_hits_to_confirm=1)
+        tracker.update(np.zeros((300, 300, 3), dtype=np.uint8), [detection((10, 10, 50, 100))])
+        self.assertEqual(face_processor.calls, 1)
+        self.assertTrue(np.array_equal(tracker.tracks[0].face_embedding, emb(0)))
 
 
 if __name__ == '__main__': unittest.main()

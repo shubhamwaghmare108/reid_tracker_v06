@@ -170,8 +170,10 @@ class ReIDTracker:
                 face = assignments.get(index)
                 self._frame_detection_index = index + 1
             else:
+                started = time.perf_counter()
                 try: _,face=self.face_processor.extract(image[y1:y2,x1:x2])
                 except Exception: pass
+                self._record_metric('FACE_INFERENCE', count=1, inference_time_ms=(time.perf_counter() - started) * 1000., face_count=1 if face is not None else 0)
         return body,face
 
     @staticmethod
@@ -236,7 +238,7 @@ class ReIDTracker:
                 continue
             for person_index, relationship in enumerate(row):
                 score = cls._face_person_score(relationship)
-                if relationship['face_center_inside'] and relationship['intersection_over_face'] >= .5 and relationship['face_center_y_ratio'] <= .75:
+                if (relationship['face_center_inside'] or relationship['intersection_over_face'] >= .5) and relationship['face_center_y_ratio'] <= .75:
                     valid.append((score, person_index))
             valid.sort(reverse=True)
             if valid and (len(valid) == 1 or valid[0][0] - valid[1][0] >= ambiguity_margin):
@@ -249,10 +251,10 @@ class ReIDTracker:
                 used_persons.add(person_index)
         ambiguous = 0
         for row in relationships:
-            valid = sorted(cls._face_person_score(item) for item in row if item['face_center_inside'] and item['intersection_over_face'] >= .5 and item['face_center_y_ratio'] <= .75)
+            valid = sorted(cls._face_person_score(item) for item in row if (item['face_center_inside'] or item['intersection_over_face'] >= .5) and item['face_center_y_ratio'] <= .75)
             if len(valid) > 1 and valid[-1] - valid[-2] < ambiguity_margin:
                 ambiguous += 1
-        return assignments, relationships, len(candidates), ambiguous, len(face_results) - len(candidates)
+        return assignments, relationships, len(candidates), ambiguous, len(face_results) - len(assignments)
 
     @staticmethod
     def _distance(a,b): return float(np.linalg.norm(Track.centre(a)-Track.centre(b)))
