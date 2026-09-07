@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from typing import List
+import time
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -164,13 +165,10 @@ class ReIDTracker:
         if self.face_processor is not None and crop.size and crop.shape[0]>=30 and crop.shape[1]>=30:
             cached_faces = getattr(self, '_frame_face_results', None)
             if cached_faces is not None:
-                candidates = []
-                for detected, embedding in cached_faces:
-                    relationship = self._face_bbox_relationship(detected, bbox)
-                    if relationship['face_center_inside'] and relationship['intersection_over_face'] >= .5:
-                        candidates.append((relationship, embedding))
-                if candidates:
-                    face = max(candidates, key=lambda item: (item[0]['intersection_over_face'], item[0]['iou']))[1]
+                index = getattr(self, '_frame_detection_index', 0)
+                assignments = getattr(self, '_frame_face_assignments', {})
+                face = assignments.get(index)
+                self._frame_detection_index = index + 1
             else:
                 try: _,face=self.face_processor.extract(image[y1:y2,x1:x2])
                 except Exception: pass
@@ -191,17 +189,70 @@ class ReIDTracker:
         intersection = max(0., x2 - x1) * max(0., y2 - y1)
         face_area = max(0., face[2] - face[0]) * max(0., face[3] - face[1])
         center_x, center_y = (face[0] + face[2]) / 2, (face[1] + face[3]) / 2
+        face_center_y_ratio = (center_y - person[1]) / max(person[3] - person[1], 1e-6)
         return {
             'iou': cls._compute_iou(face, person),
             'intersection_over_face': intersection / face_area if face_area else 0.,
             'face_center_inside': bool(person[0] <= center_x <= person[2] and person[1] <= center_y <= person[3]),
+            'face_center_y_ratio': float(face_center_y_ratio),
         }
 
     @classmethod
     def _calculate_face_bbox_relationships(cls, face_results, person_boxes):
         """Calculate relationships for every detected face and person box pair."""
-        return [[cls._face_bbox_relationship(face_box, person_box) for person_box in person_boxes]
-                for face_box, _ in (face_results or [])]
+        return [[cls._face_bbox_relationship(cls._face_result_box(face), person_box) for person_box in person_boxes]
+                for face in (face_results or [])]
+
+    @staticmethod
+    def _face_result_box(face_result):
+        return getattr(face_result, 'bbox', face_result[0] if isinstance(face_result, (tuple, list)) else face_result)
+
+    @staticmethod
+    def _face_result_embedding(face_result):
+        return getattr(face_result, 'embedding', face_result[1] if isinstance(face_result, (tuple, list)) else None)
+
+    @staticmethod
+    def _face_result_confidence(face_result):
+        return float(getattr(face_result, 'confidence', 1.0))
+
+    @classmethod
+    def _face_person_score(cls, relationship):
+        """Score valid face/person geometry, prioritizing containment and upper position."""
+        center = 1.0 if relationship['face_center_inside'] else 0.0
+        upper = relationship['face_center_y_ratio']
+        return .55 * center + .30 * relationship['intersection_over_face'] + .15 * max(0., 1. - upper / .75)
+
+    @classmethod
+    def _associate_faces_to_persons(cls, face_results, person_boxes, min_confidence=.0, min_face_size=1., ambiguity_margin=.10):
+        """Assign each face to at most one person, leaving weak or ambiguous faces unassigned."""
+        face_results = face_results or []
+        relationships = cls._calculate_face_bbox_relationships(face_results, person_boxes)
+        candidates = []
+        for face_index, row in enumerate(relationships):
+            valid = []
+            face_box = cls._face_result_box(face_results[face_index])
+            face_size = min(face_box[2] - face_box[0], face_box[3] - face_box[1])
+            if cls._face_result_confidence(face_results[face_index]) < min_confidence or face_size < min_face_size:
+                continue
+            for person_index, relationship in enumerate(row):
+                score = cls._face_person_score(relationship)
+                if relationship['face_center_inside'] and relationship['intersection_over_face'] >= .5 and relationship['face_center_y_ratio'] <= .75:
+                    valid.append((score, person_index))
+            valid.sort(reverse=True)
+            if valid and (len(valid) == 1 or valid[0][0] - valid[1][0] >= ambiguity_margin):
+                candidates.append((valid[0][0], face_index, valid[0][1]))
+        assignments = {}
+        used_persons = set()
+        for _, face_index, person_index in sorted(candidates, reverse=True):
+            if person_index not in used_persons:
+                assignments[person_index] = cls._face_result_embedding(face_results[face_index])
+                used_persons.add(person_index)
+        ambiguous = 0
+        for row in relationships:
+            valid = sorted(cls._face_person_score(item) for item in row if item['face_center_inside'] and item['intersection_over_face'] >= .5 and item['face_center_y_ratio'] <= .75)
+            if len(valid) > 1 and valid[-1] - valid[-2] < ambiguity_margin:
+                ambiguous += 1
+        return assignments, relationships, len(candidates), ambiguous, len(face_results) - len(candidates)
 
     @staticmethod
     def _distance(a,b): return float(np.linalg.norm(Track.centre(a)-Track.centre(b)))
@@ -435,20 +486,34 @@ class ReIDTracker:
     def update(self,image,detections):
         self.frame_count+=1
         self._frame_face_results = None
-        if self.face_processor is not None:
+        face_started = time.perf_counter()
+        face_inference_calls = 0
+        if self.face_processor is not None and hasattr(self.face_processor, 'extract_faces'):
             try:
+                face_inference_calls = 1
                 self._frame_face_results = self.face_processor.extract_faces(image)
             except Exception:
                 logger.debug('Frame-wide face extraction failed; continuing without face evidence.', exc_info=True)
+        self._record_metric('FACE_INFERENCE', count=face_inference_calls,
+                            inference_time_ms=(time.perf_counter() - face_started) * 1000.,
+                            face_count=len(self._frame_face_results or []))
         for t in self.tracks:
             if t.state!=TrackState.DELETED:
                 t.predict()
                 if t.identity_locked and t.identity_lock_frame is not None and self.frame_count - t.identity_lock_frame >= self.identity_lock_timeout:
                     self._release_identity_owner(t)
         detections = self._prepare_detections(detections, image.shape)
-        boxes=[];bodies=[];faces=[];detection_confidences=[]
-        for det in detections:
-            box=np.asarray(det.box,dtype=np.float32);body,face=self._extract_embeddings(image,box,det.mask);boxes.append(box);bodies.append(body);faces.append(face);detection_confidences.append(float(getattr(det, 'confidence', 1.)))
+        boxes=[np.asarray(det.box,dtype=np.float32) for det in detections]
+        self._frame_face_assignments, self._frame_face_relationships, _, face_ambiguous, face_unassigned = self._associate_faces_to_persons(
+            self._frame_face_results, boxes, min_confidence=.5, min_face_size=8.)
+        self._record_metric('FACE_PERSON_MATCH_ATTEMPT', count=len(self._frame_face_results or []) * len(boxes))
+        self._record_metric('FACE_PERSON_MATCH', count=len(self._frame_face_assignments))
+        self._record_metric('FACE_PERSON_AMBIGUOUS', count=face_ambiguous)
+        self._record_metric('FACE_PERSON_UNASSIGNED', count=max(0, face_unassigned - face_ambiguous))
+        self._frame_detection_index = 0
+        bodies=[];faces=[];detection_confidences=[]
+        for det, box in zip(detections, boxes):
+            body,face=self._extract_embeddings(image,box,det.mask);bodies.append(body);faces.append(face);detection_confidences.append(float(getattr(det, 'confidence', 1.)))
         self._frame_face_bbox_relationships = self._calculate_face_bbox_relationships(self._frame_face_results, boxes)
         normal=[t for t in self.tracks if t.state in (TrackState.TENTATIVE,TrackState.CONFIRMED,TrackState.RECOVERED)]; matches,unmatched,unused=self._associate_detections(normal,boxes,bodies,faces)
         for ti,di,score in matches:

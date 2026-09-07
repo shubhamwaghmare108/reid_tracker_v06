@@ -1,8 +1,19 @@
 """Face detection and face-embedding extraction using InsightFace."""
 from __future__ import annotations
+from dataclasses import dataclass
 import numpy as np
 import cv2
 from insightface.app import FaceAnalysis
+
+
+@dataclass
+class FaceDetection:
+    """Frame-level face observation passed to the person association stage."""
+    bbox: np.ndarray
+    embedding: np.ndarray
+    confidence: float = 1.0
+    identity: str | None = None
+    similarity: float | None = None
 
 class FaceProcessor:
     """Choose an available ONNX runtime provider and produce normalized face vectors."""
@@ -35,14 +46,15 @@ class FaceProcessor:
     def _faces(self, image: np.ndarray):
         return self.app.get(image)
 
-    def extract_faces(self, image: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    def extract_faces(self, image: np.ndarray) -> list[FaceDetection]:
         """Detect all faces once for a frame so person crops can reuse the results."""
         results = []
         for face in self._faces(image):
             embedding = face.embedding.astype(np.float32, copy=False)
             norm = np.linalg.norm(embedding)
             if norm > 1e-12:
-                results.append((face.bbox.astype(np.float32), embedding / norm))
+                results.append(FaceDetection(face.bbox.astype(np.float32), embedding / norm,
+                                              float(getattr(face, 'det_score', 1.0))))
         return results
 
     def extract_from_face_crop(self, face_image: np.ndarray) -> np.ndarray | None:
